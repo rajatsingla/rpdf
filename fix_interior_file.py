@@ -17,14 +17,17 @@
 # pip install pymupdf numpy
 #
 # One entry point that fixes an interior (book block) PDF given as bytes:
-#   1. Remove crop marks if present (no flaps, no whitespace trim), and cut any
-#      bleed the crop left behind, so the page lands on the trim line.
-#   2. Match the page size to the supported book trim sizes, allowing up to
+#   1. Match the page size to the supported book trim sizes, allowing up to
 #      +0.25 in of added trim/bleed.
+#   2. Only when it does not match: remove crop marks if present (no flaps, no
+#      whitespace trim), cut any bleed the crop left behind so the page lands on
+#      the trim line, and match again on the cut size. A file that already
+#      measures as a supported size is never cut - see fix_interior_file.
 #   3. Always run the resize pipeline to normalise the file:
 #        - match found  -> resize to the file's own dimensions (normalise only,
 #                          which also fixes stray rotated/horizontal pages).
 #        - no match     -> resize to the closest supported trim size.
+#   4. Always embed a font program for any font referenced by name only.
 #
 # All detection/editing logic is reused from the existing scripts in this folder.
 
@@ -37,6 +40,7 @@ from remove_crop_marks import (
 )
 from resize import resize_doc
 from fix_cover import _apply_clip
+from embed_fonts import embed_missing_fonts
 
 POINTS_PER_INCH = 72
 
@@ -257,14 +261,40 @@ def _trim_retained_bleed(
     return fitz.Rect(clip.x0 + dx, clip.y0 + dy, clip.x1 - dx, clip.y1 - dy)
 
 
+def _target_size_in(
+    width_in: float, height_in: float, kind: str, size: dict
+) -> tuple[float, float]:
+    """
+    Pick the dimensions to resize to for a measured page and its match result.
+
+    A match that is only measurement noise away from its standard size is snapped
+    to the exact standard dims, so the output is perfectly sized. A match that
+    carries real added bleed keeps its own dims, so the content is not
+    scaled/distorted and the resize pass only normalises. No match resizes to the
+    closest supported size.
+    """
+    if kind != "match":
+        return size["width_in"], size["height_in"]
+
+    within_error = (
+        abs(width_in - size["width_in"]) <= SIZE_MATCH_ERROR_IN
+        and abs(height_in - size["height_in"]) <= SIZE_MATCH_ERROR_IN
+    )
+    if within_error:
+        return size["width_in"], size["height_in"]
+
+    return width_in, height_in
+
+
 def fix_interior_file(
     pdf_bytes: bytes,
     output_path: str | None = None,
     is_domestic: bool = False,
 ) -> bytes:
     """
-    Fix an interior PDF: remove crop marks, match to a supported size, and
-    resize/normalise.
+    Fix an interior PDF: match to a supported size, cutting the file down only if
+    it does not already measure as one, resize/normalise, and embed any font the
+    file references without carrying.
 
     Args:
         pdf_bytes:   The interior PDF as bytes.
@@ -274,46 +304,49 @@ def fix_interior_file(
     Returns:
         The final PDF as bytes.
     """
-    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    # Stage A: remove crop marks (BleedBox / TrimBox / visual marks), then cut
-    # any bleed the crop kept, so the page ends up on the trim line.
-    # Interiors are geometrically uniform, so detect the clip once and reuse it
-    # for every page. This avoids a full-page render per page, which is the
-    # dominant cost for large multi-page files.
-    stage_a = fitz.open()
-    stage_a.set_metadata(src.metadata)
-    clip = _trim_retained_bleed(_crop_marks_clip(src), src[0].rect, is_domestic)
-    for page_index in range(src.page_count):
-        _apply_clip(src, page_index, stage_a, clip)
-    src.close()
-
-    # Match the (uniform) page size against the supported trim sizes.
-    width_in = stage_a[0].rect.width / POINTS_PER_INCH
-    height_in = stage_a[0].rect.height / POINTS_PER_INCH
+    width_in = doc[0].rect.width / POINTS_PER_INCH
+    height_in = doc[0].rect.height / POINTS_PER_INCH
     kind, size = _match_size(width_in, height_in, is_domestic)
 
-    if kind == "match":
-        within_error = (
-            abs(width_in - size["width_in"]) <= SIZE_MATCH_ERROR_IN
-            and abs(height_in - size["height_in"]) <= SIZE_MATCH_ERROR_IN
-        )
-        if within_error:
-            # Essentially the trim size already (only measurement noise): snap to
-            # the exact standard dims so the output is perfectly sized.
-            target_w_in, target_h_in = size["width_in"], size["height_in"]
-        else:
-            # Carries real added bleed: keep its own dims so the content is not
-            # scaled/distorted; resize only normalises (e.g. stray rotated pages).
-            target_w_in, target_h_in = width_in, height_in
-    else:
-        target_w_in, target_h_in = size["width_in"], size["height_in"]
+    # A file that already measures as a supported trim size - exactly, or as that
+    # size plus up to TRIM_TOLERANCE_IN of bleed - is accepted as it stands, so
+    # there is nothing to gain by cutting it: crop-mark removal, the retained-bleed
+    # shave and whitespace trimming can only take real content off a page that
+    # already passes. It still goes through the resize pass below, which normalises
+    # the block (a stray page left rotated/horizontal is the common case) and is
+    # also where fonts get checked, so the file is not passed through untouched.
+    if kind != "match":
+        # Remove crop marks (BleedBox / TrimBox / visual marks), then cut any bleed
+        # the crop kept, so the page ends up on the trim line. Interiors are
+        # geometrically uniform, so detect the clip once and reuse it for every
+        # page. This avoids a full-page render per page, which is the dominant cost
+        # for large multi-page files.
+        cut = fitz.open()
+        cut.set_metadata(doc.metadata)
+        clip = _trim_retained_bleed(_crop_marks_clip(doc), doc[0].rect, is_domestic)
+        for page_index in range(doc.page_count):
+            _apply_clip(doc, page_index, cut, clip)
+        doc.close()
+        doc = cut
 
-    # Stage B: resize / normalise.
-    resize_doc(stage_a, target_w_in, target_h_in)
+        # Match again: the cut may well have landed the page on a supported size.
+        width_in = doc[0].rect.width / POINTS_PER_INCH
+        height_in = doc[0].rect.height / POINTS_PER_INCH
+        kind, size = _match_size(width_in, height_in, is_domestic)
 
-    data = stage_a.tobytes(garbage=4, deflate=True)
-    stage_a.close()
+    target_w_in, target_h_in = _target_size_in(width_in, height_in, kind, size)
+    resize_doc(doc, target_w_in, target_h_in)
+
+    # Print requires the fonts to travel with the file, and a page-geometry pass
+    # is the only place the block gets rewritten, so check on every run - the
+    # file that needed no cutting is exactly the one that would otherwise go out
+    # with its fonts still referenced by name only.
+    embed_missing_fonts(doc)
+
+    data = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
 
     if output_path is not None:
         with open(output_path, "wb") as f:
