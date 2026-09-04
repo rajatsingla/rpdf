@@ -531,7 +531,8 @@ a { color: var(--color-accent); text-underline-offset: 3px; }
   var PDFJS_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
   var PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
- 
+  // Empty talks to the page's own origin. Set an absolute base to point the page
+  // at a deployment elsewhere; endpoint names are appended, so no trailing slash.
   var API_BASE = "";
 
   function apiUrl(name) {

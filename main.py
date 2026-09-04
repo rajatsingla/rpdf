@@ -26,7 +26,6 @@ import os
 from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from starlette.concurrency import run_in_threadpool
 
@@ -71,15 +70,10 @@ def source() -> dict:
     return {"license": "AGPL-3.0-or-later", "source": SOURCE_URL}
 
 
-# Allow the browser to call this API directly (no Node proxy). Override with
-# ALLOW_ORIGINS=https://foo.com,https://bar.com ; default "*" for any origin.
-_origins = ["https://stck.dev", "https://stck.me"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in _origins if o.strip()],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+# No CORS handling here on purpose. The nginx gateway in front of this service
+# answers the preflight itself and adds Access-Control-Allow-Origin: * to the
+# responses it proxies; a second value sent from here would leave the browser
+# with two and it would reject the response.
 
 
 @app.get("/rpdf/health")
