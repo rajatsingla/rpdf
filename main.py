@@ -73,7 +73,7 @@ def source() -> dict:
 
 # Allow the browser to call this API directly (no Node proxy). Override with
 # ALLOW_ORIGINS=https://foo.com,https://bar.com ; default "*" for any origin.
-_origins = os.environ.get("ALLOW_ORIGINS", "*").split(",")
+_origins = ["https://stck.dev", "https://stck.me"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in _origins if o.strip()],
