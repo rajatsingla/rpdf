@@ -531,6 +531,13 @@ a { color: var(--color-accent); text-underline-offset: 3px; }
   var PDFJS_SRC = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
   var PDFJS_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
+ 
+  var API_BASE = "";
+
+  function apiUrl(name) {
+    return (API_BASE || "/rpdf") + "/" + name;
+  }
+
   // ————————————————— shared by both fix flows —————————————————
 
   function fmt(n) {
@@ -700,9 +707,7 @@ a { color: var(--color-accent); text-underline-offset: 3px; }
 
   function interior() {
 
-  // Same origin as the page (served at GET /rpdf), so no CORS and no
-  // mixed-content path to worry about.
-  var API = "/rpdf/interiors";
+  var API = apiUrl("interiors");
 
   // Print geometry, in inches. Mirrors the design's props.
   var TRIM_IN = 0.125;
@@ -992,7 +997,7 @@ a { color: var(--color-accent); text-underline-offset: 3px; }
 
   function cover() {
 
-  var API = "/rpdf/covers";
+  var API = apiUrl("covers");
 
   // The stage a full spread has to fit into, in CSS pixels.
   var MAX_W = 900;

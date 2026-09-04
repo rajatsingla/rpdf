@@ -87,7 +87,7 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/rpdf/page")
+@app.get("/rpdf")
 def index() -> FileResponse:
     # Serve the UI from the same origin as the API (no CORS/mixed-content issues).
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
