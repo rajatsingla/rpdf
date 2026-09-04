@@ -70,6 +70,7 @@ def source() -> dict:
     """AGPL-3.0 source offer (see the LICENSE file at the repository root)."""
     return {"license": "AGPL-3.0-or-later", "source": SOURCE_URL}
 
+
 # Allow the browser to call this API directly (no Node proxy). Override with
 # ALLOW_ORIGINS=https://foo.com,https://bar.com ; default "*" for any origin.
 _origins = os.environ.get("ALLOW_ORIGINS", "*").split(",")
@@ -86,7 +87,7 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/rpdf")
+@app.get("/rpdf/page")
 def index() -> FileResponse:
     # Serve the UI from the same origin as the API (no CORS/mixed-content issues).
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
