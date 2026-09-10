@@ -30,6 +30,8 @@
 # bleed tolerance here: the caller states the final size outright, so a match is
 # an exact match (bar measurement noise). See _is_final_size.
 
+import logging
+
 import fitz  # PyMuPDF
 
 from remove_crop_marks import (
@@ -46,8 +48,10 @@ from trim_white_space import (
     PADDING_PT,
 )
 from trim_flaps import detect_flap_clip
-from resize import resize_doc
+from resize import needs_flattening, resize_doc
 from embed_fonts import embed_missing_fonts
+
+log = logging.getLogger(__name__)
 
 POINTS_PER_INCH = 72
 
@@ -57,6 +61,14 @@ POINTS_PER_INCH = 72
 # unlike an interior, whose size is inferred from a list of standard trim sizes
 # and so is allowed to arrive as "standard size plus up to 0.25 in of bleed".
 SIZE_MATCH_ERROR_IN = 0.01
+
+# Most a page may measure over the requested final size, per axis, and still be
+# treated as marks/bleed/slug to be cropped off rather than artwork to be scaled
+# down. A press sheet carries bleed plus a mark and slug margin - commonly
+# 0.25-0.5 in a side - so an inch on an axis is ordinary and two is generous.
+# Past that the file is not an oversized press sheet, it is a different size, and
+# scaling it (with resize_doc's warning) is the honest answer.
+MAX_CROPPABLE_SURPLUS_IN = 2.0
 
 
 def _is_final_size(
@@ -100,6 +112,51 @@ def _apply_clip(src: fitz.Document, page_index: int, out: fitz.Document, clip: f
     new_page.set_artbox(new_page.rect)
 
 
+def carry_over_links(
+    src: fitz.Document, out: fitz.Document, clips: list[fitz.Rect]
+) -> None:
+    """
+    Re-attach ``src``'s links and bookmarks to the rebuilt pages in ``out``.
+
+    Rebuilding a page with show_pdf_page copies its content, not the annotations
+    layered over it, and a fresh document has no outline - so an interior would
+    otherwise leave with its cross-references and table of contents stripped.
+    ``clips`` holds the crop taken from each page, in order, so a link rectangle
+    can be moved into the rebuilt page's coordinates; a link lying wholly outside
+    the kept area goes away with the artwork it sat on.
+
+    Runs after every page exists: a GoTo link is resolved against the destination
+    document as it is inserted, so one pointing at a page not yet added fails.
+    """
+    for page_index, clip in enumerate(clips):
+        offset = (-clip.x0, -clip.y0, -clip.x0, -clip.y0)
+        out_page = out[page_index]
+
+        for link in src[page_index].get_links():
+            moved = fitz.Rect(link["from"]) + offset
+            if (moved & out_page.rect).is_empty:
+                continue
+
+            link = {**link, "from": moved}
+
+            # An internal link also names a point on the page it jumps to, in
+            # that page's coordinates, so it shifts by that page's crop and not
+            # by this one's.
+            target = link.get("page", -1)
+            if link.get("to") is not None and 0 <= target < len(clips):
+                target_clip = clips[target]
+                link["to"] = fitz.Point(
+                    link["to"].x - target_clip.x0,
+                    link["to"].y - target_clip.y0,
+                )
+
+            out_page.insert_link(link)
+
+    toc = src.get_toc()
+    if toc:
+        out.set_toc(toc)
+
+
 def _declares_trimmed(page: fitz.Page) -> bool:
     """
     True when the page declares no area outside its own trim, i.e. every standard
@@ -121,13 +178,19 @@ def _declares_trimmed(page: fitz.Page) -> bool:
 
 def _both_sided_only(clip: fitz.Rect, page_rect: fitz.Rect) -> fitz.Rect:
     """
-    Keep only the whitespace that shows up on BOTH sides of an axis.
+    Keep only the whitespace that shows up on BOTH sides of an axis, and take the
+    same amount off each end of it.
 
     Excess white around a press file surrounds the artwork, so it appears left
     and right, or top and bottom. White down one side alone is the cover's own
     margin - the space the design leaves above its title - and shaving it both
     deletes that margin and pulls the artwork off centre. So an axis is left
     whole unless both of its edges have white to give.
+
+    Even then only the smaller of the two amounts comes off both ends. An uneven
+    shave moves the centre of the artwork, and stage C then scales that
+    off-centre crop up to the finished size, so a cover's spine ends up away from
+    the middle of the wrap - the file measures right and the panels do not.
     """
     left = clip.x0 - page_rect.x0
     right = page_rect.x1 - clip.x1
@@ -136,9 +199,13 @@ def _both_sided_only(clip: fitz.Rect, page_rect: fitz.Rect) -> fitz.Rect:
 
     if min(left, right) <= MIN_CROP_PT:
         left = right = 0.0
+    else:
+        left = right = min(left, right)
 
     if min(top, bottom) <= MIN_CROP_PT:
         top = bottom = 0.0
+    else:
+        top = bottom = min(top, bottom)
 
     return fitz.Rect(
         page_rect.x0 + left,
@@ -146,6 +213,112 @@ def _both_sided_only(clip: fitz.Rect, page_rect: fitz.Rect) -> fitz.Rect:
         page_rect.x1 - right,
         page_rect.y1 - bottom,
     )
+
+
+def _fmt(rect: fitz.Rect) -> str:
+    """``rect`` as inches, for the log."""
+    return (
+        f"{rect.width / POINTS_PER_INCH:.4g}x{rect.height / POINTS_PER_INCH:.4g} in "
+        f"@({rect.x0:.1f},{rect.y0:.1f})pt"
+    )
+
+
+def _chose(clip: fitz.Rect, rung: str) -> fitz.Rect:
+    """Log which rung of the trim ladder fired, then return its clip."""
+    log.info("cover trim: %s -> %s", rung, _fmt(clip))
+    return clip
+
+
+def _log_input(page: fitz.Page, final_width_in: float, final_height_in: float) -> None:
+    """
+    Record the geometry the file arrived with.
+
+    Everything that can put a cover's artwork somewhere other than where it
+    belongs is visible here: a MediaBox origin away from (0, 0), a CropBox
+    smaller than the MediaBox, a declared trim that disagrees with what was
+    asked for, a /Rotate. Without it a complaint about a shifted spine cannot be
+    traced back to the file that caused it.
+    """
+    log.info(
+        "cover in: page %s media %s crop %s trim %s bleed %s rotate %s "
+        "-> requested %.4gx%.4g in",
+        _fmt(page.rect), _fmt(page.mediabox), _fmt(page.cropbox),
+        _fmt(page.trimbox), _fmt(page.bleedbox), page.rotation,
+        final_width_in, final_height_in,
+    )
+
+
+def _crop_to_final(
+    page: fitz.Page, final_width_in: float, final_height_in: float
+) -> fitz.Rect | None:
+    """
+    Last resort: a window of exactly the requested size, centred on the ink.
+
+    Nothing was detected, so there is no declared or drawn cut line to crop to -
+    but the caller has named the finished size, and a page measuring more than
+    that is carrying bleed, crop marks and slug that all have to come off.
+    Cutting a window of the requested size takes them off and leaves every panel
+    at its own size. The alternative, which is what returning None means, is to
+    let stage C scale the whole sheet: that squeezes the marks and the white
+    margin into the finished cover along with the design, shrinking every panel
+    and, where the two axes disagree, stretching the artwork as well. On a
+    12.4409x9.4488 in sheet asked for an 11.65x8.76 in cover that is a 0.35 in
+    loss on each panel and a 1% aspect error.
+
+    Centred on the ink rather than on the sheet: a mark and slug margin is often
+    wider on one side, and centring on the sheet would carry that asymmetry
+    straight into the spine position.
+
+    Returns None when cropping cannot do the job - a page smaller than the
+    request on either axis, or so much larger that the surplus cannot be marks.
+    """
+    page_rect = page.rect
+
+    want_w = final_width_in * POINTS_PER_INCH
+    want_h = final_height_in * POINTS_PER_INCH
+
+    surplus_w = page_rect.width - want_w
+    surplus_h = page_rect.height - want_h
+    limit = MAX_CROPPABLE_SURPLUS_IN * POINTS_PER_INCH
+
+    # Not even on an axis: a window bigger than the page cannot be cut out of it,
+    # and clamping one to fit would hand back something other than the size asked
+    # for. Rung 0 has already let through anything within SIZE_MATCH_ERROR_IN, so
+    # what is left here is genuinely undersized and belongs to stage C.
+    if surplus_w < 0 or surplus_h < 0:
+        log.info(
+            "cover: page is smaller than the requested size on an axis "
+            "(%.3g x %.3g in surplus), cannot crop to it",
+            surplus_w / POINTS_PER_INCH, surplus_h / POINTS_PER_INCH,
+        )
+        return None
+
+    if surplus_w > limit or surplus_h > limit:
+        log.warning(
+            "cover: page exceeds the requested size by %.3g x %.3g in, more than "
+            "MAX_CROPPABLE_SURPLUS_IN=%.3g - treating as a different size, not as "
+            "marks to crop",
+            surplus_w / POINTS_PER_INCH, surplus_h / POINTS_PER_INCH,
+            MAX_CROPPABLE_SURPLUS_IN,
+        )
+        return None
+
+    # Centre of the printed area, falling back to the centre of the sheet on a
+    # page that reads as blank.
+    ink = detect_nonwhite_bbox(page)
+    box = ink if ink is not None else page_rect
+    cx = (box.x0 + box.x1) / 2
+    cy = (box.y0 + box.y1) / 2
+
+    x0 = cx - want_w / 2
+    y0 = cy - want_h / 2
+
+    # Keep the window on the page; centring on ink that sits near an edge can
+    # otherwise push it off.
+    x0 = min(max(x0, page_rect.x0), page_rect.x1 - want_w)
+    y0 = min(max(y0, page_rect.y0), page_rect.y1 - want_h)
+
+    return fitz.Rect(x0, y0, x0 + want_w, y0 + want_h)
 
 
 def _trim_clip(
@@ -159,6 +332,8 @@ def _trim_clip(
       3. else visual crop-mark detection
       4. else whitespace crop, but only on a page that does not declare itself
          already trimmed, and only on axes with white to spare at both ends
+      5. else a window of exactly the requested size cut out of an oversized
+         page, centred on the ink
     Falls back to the full page rect if nothing qualifies.
 
     The size check runs before each step, so the ladder stops at the first thing
@@ -168,7 +343,7 @@ def _trim_clip(
 
     # 0. Already the finished size - nothing to trim.
     if _is_final_size(page_rect, final_width_in, final_height_in):
-        return page_rect
+        return _chose(page_rect, "page is already the final size")
 
     bleed = existing_box_clip(page, page.bleedbox)
     trim = existing_box_clip(page, page.trimbox)
@@ -178,21 +353,21 @@ def _trim_clip(
     # for a 12x9 cover is stating where the knife goes; cropping to the bleed by
     # rank alone would keep that bleed and then scale it into the finished cover,
     # shrinking the artwork and pulling the spine off centre.
-    for candidate in (bleed, trim):
+    for name, candidate in (("bleedbox", bleed), ("trimbox", trim)):
         if candidate is not None and _is_final_size(
             candidate, final_width_in, final_height_in
         ):
-            return candidate
+            return _chose(candidate, f"{name} is the final size")
 
     # 1. BleedBox / 2. TrimBox, by declared priority.
-    for candidate in (bleed, trim):
+    for name, candidate in (("bleedbox", bleed), ("trimbox", trim)):
         if candidate is not None:
-            return candidate
+            return _chose(candidate, f"declared {name}")
 
     # 3. Visual crop marks
     clip, info = detect_crop_mark_clip(page)
     if info.get("detected"):
-        return clip
+        return _chose(clip, "detected crop marks")
 
     # 4. Whitespace fallback
     detected = None if _declares_trimmed(page) else detect_nonwhite_bbox(page)
@@ -203,9 +378,15 @@ def _trim_clip(
         # single stray dark pixel (or the any-non-white fallback inside
         # detect_nonwhite_bbox) could crop the cover down to a speck.
         if has_real_crop(page_rect, detected) and is_valid_clip(detected, page_rect):
-            return detected
+            return _chose(detected, "whitespace")
 
-    return page_rect
+    # 5. Nothing found. Cut the requested size out of the sheet rather than leave
+    # the marks on and let stage C scale them into the cover.
+    to_final = _crop_to_final(page, final_width_in, final_height_in)
+    if to_final is not None:
+        return _chose(to_final, "cropped to the requested size, centred on the ink")
+
+    return _chose(page_rect, "nothing to trim")
 
 
 def _clipped(doc: fitz.Document, clip: fitz.Rect) -> fitz.Document:
@@ -216,6 +397,7 @@ def _clipped(doc: fitz.Document, clip: fitz.Rect) -> fitz.Document:
     out = fitz.open()
     out.set_metadata(doc.metadata)
     _apply_clip(doc, 0, out, clip)
+    carry_over_links(doc, out, [clip])
     doc.close()
     return out
 
@@ -231,8 +413,9 @@ def fix_cover(
 
     Pipeline:
       0.   Keep only the first page (a cover is a single page).
-      1-4. Crop to BleedBox / TrimBox / detected crop marks / whitespace, unless
-           the page already measures the final size.
+      1-5. Crop to BleedBox / TrimBox / detected crop marks / whitespace / a
+           window of the requested size, unless the page already measures the
+           final size.
       5.   Detect and remove flaps, unless the page already measures the final
            size.
       6.   Resize to ``final_width_in`` x ``final_height_in`` (inches).
@@ -261,10 +444,21 @@ def fix_cover(
     if doc.page_count > 1:
         doc.delete_pages(from_page=1, to_page=doc.page_count - 1)
 
+    _log_input(doc[0], final_width_in, final_height_in)
+
     # Stage A: trim (bleed / trim / crop marks / whitespace).
     if not _is_final_size(doc[0].rect, final_width_in, final_height_in):
+        page_rect = doc[0].rect
         clip = _trim_clip(doc[0], final_width_in, final_height_in)
-        if rects_different(clip, doc[0].rect):
+        if rects_different(clip, page_rect):
+            # Removed amounts, per edge. An uneven pair on either axis is what
+            # moves a cover's spine off centre once stage C scales the crop back
+            # up, so it is the first thing to look at on a complaint.
+            log.info(
+                "cover trim: removed l=%.2f r=%.2f t=%.2f b=%.2f pt",
+                clip.x0 - page_rect.x0, page_rect.x1 - clip.x1,
+                clip.y0 - page_rect.y0, page_rect.y1 - clip.y1,
+            )
             doc = _clipped(doc, clip)
 
         # Stage B: remove flaps - but only if the trim did not already land the
@@ -274,6 +468,14 @@ def fix_cover(
             clip, _info = detect_flap_clip(doc[0])
             if rects_different(clip, doc[0].rect):
                 doc = _clipped(doc, clip)
+
+    # Stage B2: flatten the page boxes before scaling. Stage C is only a correct
+    # transform on a page whose MediaBox is its visible page and starts at
+    # (0, 0); see resize.needs_flattening. A page rebuilt by _clipped above is
+    # already flat, so this costs nothing on the paths that trimmed.
+    if needs_flattening(doc[0]):
+        log.info("cover: flattening page boxes before resize")
+        doc = _clipped(doc, doc[0].rect)
 
     # Stage C: resize to final dimensions.
     resize_doc(doc, final_width_in, final_height_in)

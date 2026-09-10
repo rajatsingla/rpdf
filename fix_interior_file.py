@@ -38,8 +38,8 @@ from remove_crop_marks import (
     detect_crop_mark_clip,
     rects_different,
 )
-from resize import resize_doc
-from fix_cover import _apply_clip
+from resize import needs_flattening, resize_doc
+from fix_cover import _apply_clip, carry_over_links
 from embed_fonts import embed_missing_fonts
 
 POINTS_PER_INCH = 72
@@ -328,6 +328,7 @@ def fix_interior_file(
         clip = _trim_retained_bleed(_crop_marks_clip(doc), doc[0].rect, is_domestic)
         for page_index in range(doc.page_count):
             _apply_clip(doc, page_index, cut, clip)
+        carry_over_links(doc, cut, [clip] * doc.page_count)
         doc.close()
         doc = cut
 
@@ -335,6 +336,21 @@ def fix_interior_file(
         width_in = doc[0].rect.width / POINTS_PER_INCH
         height_in = doc[0].rect.height / POINTS_PER_INCH
         kind, size = _match_size(width_in, height_in, is_domestic)
+
+    # Flatten the page boxes before scaling. resize_doc is only a correct
+    # transform on a page whose MediaBox is its visible page and starts at
+    # (0, 0); see resize.needs_flattening. Pages rebuilt by the cut above are
+    # already flat, so this only costs anything on the match path, which does no
+    # cutting and would otherwise hand a raw press page straight to the scaler.
+    if needs_flattening(doc[0]):
+        flat = fitz.open()
+        flat.set_metadata(doc.metadata)
+        clips = [doc[page_index].rect for page_index in range(doc.page_count)]
+        for page_index, page_clip in enumerate(clips):
+            _apply_clip(doc, page_index, flat, page_clip)
+        carry_over_links(doc, flat, clips)
+        doc.close()
+        doc = flat
 
     target_w_in, target_h_in = _target_size_in(width_in, height_in, kind, size)
     resize_doc(doc, target_w_in, target_h_in)

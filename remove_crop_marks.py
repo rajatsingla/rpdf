@@ -98,6 +98,30 @@ def is_valid_clip(clip: fitz.Rect, page_rect: fitz.Rect) -> bool:
     return True
 
 
+def box_to_page_rect(page: fitz.Page, box: fitz.Rect) -> fitz.Rect:
+    """
+    Convert a declared page box into page coordinates.
+
+    PyMuPDF reports TrimBox/BleedBox/ArtBox/CropBox in the file's own coordinate
+    space, but ``page.rect``, ``get_pixmap`` and ``show_pdf_page(clip=...)`` all
+    work in page coordinates, whose origin is the top-left of the CropBox. The
+    two only coincide when the CropBox origin happens to be (0, 0). On a press
+    export whose origin sits at the trim corner with the bleed running negative -
+    MediaBox [-36 -36 856.8 648] and the like - using a raw box as a clip crops a
+    correctly sized window from the wrong place: the file measures right and the
+    artwork is bodily shifted, so a cover's spine lands off centre and one panel
+    gains exactly what the other loses.
+
+    Shifting by the CropBox origin and then applying the page rotation maps the
+    box onto the same space as ``page.rect``.
+    """
+    cropbox = page.cropbox
+
+    shift = fitz.Matrix(1, 0, 0, 1, -cropbox.x0, -cropbox.y0)
+
+    return fitz.Rect(box) * shift * page.rotation_matrix
+
+
 def existing_box_clip(page: fitz.Page, box: fitz.Rect | None) -> fitz.Rect | None:
     """
     Use a PDF page box (TrimBox or BleedBox) when available.
@@ -113,6 +137,9 @@ def existing_box_clip(page: fitz.Page, box: fitz.Rect | None) -> fitz.Rect | Non
 
     if not box or box.is_empty:
         return None
+
+    # Declared boxes are not in page coordinates; convert before using as a clip.
+    box = box_to_page_rect(page, box)
 
     # Keep clip inside current page rectangle.
     box = box & page_rect
